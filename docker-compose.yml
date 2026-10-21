@@ -1,0 +1,192 @@
+name: fraud-airflow
+
+x-pipeline-env: &pipeline-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  POSTGRES_DB: ${POSTGRES_DB:-fraud_db}
+  POSTGRES_USER: ${POSTGRES_USER:-fraud_user}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud_pass}
+  TRAINING_DATA_DIR: /opt/airflow/training_data
+  MODELS_DIR: /opt/airflow/artifacts/models
+  CANDIDATES_DIR: /opt/airflow/artifacts/candidates
+  DQ_REPORTS_DIR: /opt/airflow/artifacts/dq_reports
+  FRAUD_SRC: /opt/airflow/fraud_src
+  SAMPLE_SIZE: ${SAMPLE_SIZE:-10000}
+  HISTORY_MONTHS: ${HISTORY_MONTHS:-36}
+  WINDOW_MONTHS: ${WINDOW_MONTHS:-3}
+
+services:
+  kafka:
+    image: apache/kafka:4.1.1
+    ports:
+      - "9095:9095"
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:9095,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9095
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    restart: unless-stopped
+
+  kafka-setup:
+    image: apache/kafka:4.1.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        for topic in transactions scoring; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$topic" --partitions 3 --replication-factor 1
+        done
+    restart: on-failure
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    profiles: ["tools"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fraud_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-fraud_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  data_loader:
+    build:
+      context: .
+      dockerfile: data_loader/Dockerfile
+    environment:
+      <<: *pipeline-env
+      LABELED_CSV_PATH: /data/train.csv
+    volumes:
+      - ${TRAIN_DATA_DIR:-./data}:/data
+      - training_data:/opt/airflow/training_data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  fraud_detector:
+    build: ./fraud_detector
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TRANSACTIONS_TOPIC: transactions
+      KAFKA_SCORING_TOPIC: scoring
+      MODELS_DIR: /artifacts/models
+    volumes:
+      - model_registry:/artifacts
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "from pathlib import Path; assert Path('/artifacts/models/latest.txt').is_file()"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  transaction_simulator:
+    build: ./transaction_simulator
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: transactions
+      TRANSACTIONS_CSV_PATH: /data/train.csv
+      SEND_INTERVAL_SECONDS: "0.2"
+    volumes:
+      - ${TRAIN_DATA_DIR:-./data}:/data:ro
+    depends_on:
+      data_loader:
+        condition: service_completed_successfully
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  scoring_writer:
+    build: ./scoring_writer
+    environment:
+      <<: *pipeline-env
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_SCORING_TOPIC: scoring
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow:
+    build: ./airflow
+    user: "0:0"
+    environment:
+      <<: *pipeline-env
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow_state/airflow.db
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "15"
+      AIRFLOW__WEBSERVER__SECRET_KEY: local-fraud-airflow
+      PYTHONPATH: /opt/airflow:/opt/airflow/fraud_src
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    volumes:
+      - ./dags:/opt/airflow/dags:ro
+      - ./pipeline:/opt/airflow/pipeline:ro
+      - ./fraud_detector/src:/opt/airflow/fraud_src:ro
+      - training_data:/opt/airflow/training_data
+      - model_registry:/opt/airflow/artifacts
+      - airflow_state:/opt/airflow/airflow_state
+    ports:
+      - "8081:8080"
+    depends_on:
+      data_loader:
+        condition: service_completed_successfully
+      fraud_detector:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  training_data:
+  model_registry:
+  airflow_state:

@@ -24,7 +24,6 @@ def _model_path(version: str) -> Path:
 
 
 def ensure_bootstrap():
-    """Кладёт зашитую модель в общий каталог, пока DAG не опубликует новую."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     latest = MODELS_DIR / "latest.txt"
     if latest.exists() and latest.read_text(encoding="utf-8").strip():
@@ -33,9 +32,14 @@ def ensure_bootstrap():
     if not dest.exists():
         if not BUNDLED_MODEL.exists():
             raise FileNotFoundError(f"Нет исходной модели: {BUNDLED_MODEL}")
-        shutil.copyfile(BUNDLED_MODEL, dest)
+        temporary = dest.with_suffix(".tmp.cbm")
+        shutil.copyfile(BUNDLED_MODEL, temporary)
+        os.replace(temporary, dest)
         logger.info("Скопирована исходная модель в %s", dest)
-    latest.write_text("initial\n", encoding="utf-8")
+    if not latest.exists():
+        temporary = MODELS_DIR / ".latest.initial.txt"
+        temporary.write_text("initial\n", encoding="utf-8")
+        os.replace(temporary, latest)
 
 
 def _read_latest_version() -> str:
@@ -58,12 +62,16 @@ def _load_model(version: str) -> CatBoostClassifier:
 
 
 def _current_model():
-    """Возвращает модель, которая соответствует latest.txt. Вызывать под _lock."""
     global _model, _version
-    version = _read_latest_version()
-    if _model is None or version != _version:
-        _model = _load_model(version)
-        _version = version
+    try:
+        version = _read_latest_version()
+        if _model is None or version != _version:
+            loaded = _load_model(version)
+            _model, _version = loaded, version
+    except Exception:
+        if _model is None:
+            raise
+        logger.exception("Новая модель недоступна, используется версия %s", _version)
     return _model, _version
 
 
@@ -71,15 +79,12 @@ def make_pred(dt, source_info="kafka"):
     with _lock:
         model, model_version = _current_model()
         features = list(model.feature_names_)
-        missing = [column for column in features if column not in dt.columns]
-        if missing:
-            raise ValueError(f"Во входных данных нет признаков модели: {missing}")
         frame = dt[features].copy()
         for idx in model.get_cat_feature_indices():
             column = features[idx]
             if not pd.api.types.is_numeric_dtype(frame[column]):
                 frame[column] = frame[column].astype(str)
-        y_proba = model.predict_proba(frame)[:, 1]
+        y_proba = model.predict_proba(frame, thread_count=2)[:, 1]
 
     submission = pd.DataFrame({
         "score": y_proba,

@@ -1,5 +1,3 @@
-"""Бесконечный поток транзакций в Kafka из размеченного CSV."""
-
 import json
 import logging
 import os
@@ -27,18 +25,14 @@ TIME_FORMAT = "%Y-%m-%d %H:%M"
 
 
 def load_transactions(path: Path) -> pd.DataFrame:
-    """Читает размеченный CSV один раз и держит его в памяти для случайной выборки."""
     if not path.exists():
         raise FileNotFoundError(f"Не найден файл транзакций: {path}")
     frame = pd.read_csv(path)
-    if "transaction_time" not in frame.columns:
-        raise ValueError("В CSV нет колонки transaction_time")
     logger.info("Загружено %s строк из %s", len(frame), path)
     return frame
 
 
 def json_safe(value):
-    """Приводит значение ячейки pandas к типу, который сериализуется в JSON."""
     if pd.isna(value):
         return None
     if hasattr(value, "item"):
@@ -47,8 +41,7 @@ def json_safe(value):
 
 
 def build_message(row: pd.Series) -> dict:
-    """Собирает сообщение топика transactions: новый id и текущее время события."""
-    data = {column: json_safe(value) for column, value in row.items()}
+    data = {column: json_safe(value) for column, value in row.items() if column != "target"}
     data["transaction_time"] = datetime.now().strftime(TIME_FORMAT)
     return {
         "transaction_id": str(uuid.uuid4()),
@@ -57,7 +50,6 @@ def build_message(row: pd.Series) -> dict:
 
 
 def connect_producer() -> KafkaProducer:
-    """Ждёт брокер и открывает продюсер с JSON-сериализацией."""
     last_error = None
     for attempt in range(1, 31):
         try:
@@ -74,7 +66,6 @@ def connect_producer() -> KafkaProducer:
 
 
 def stream_transactions(frame: pd.DataFrame, producer: KafkaProducer) -> None:
-    """Без остановки шлёт случайные строки в Kafka с паузой SEND_INTERVAL_SECONDS."""
     row_count = len(frame)
     sent = 0
     while True:
@@ -93,7 +84,6 @@ def stream_transactions(frame: pd.DataFrame, producer: KafkaProducer) -> None:
 
 
 def main() -> None:
-    """Загружает CSV и запускает бесконечную поставку транзакций."""
     frame = load_transactions(CSV_PATH)
     producer = connect_producer()
     logger.info(

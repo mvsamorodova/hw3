@@ -6,6 +6,10 @@ from pathlib import Path
 
 import pandas as pd
 import psycopg2
+from dateutil.relativedelta import relativedelta
+
+from pipeline.settings import WINDOW_MONTHS
+from pipeline.artifacts import write_parquet
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,12 +41,6 @@ COLUMNS = [
     "merchant_lon",
     "target",
 ]
-
-# Исходное окно обучения: январь–март 2019 включительно.
-INITIAL_WINDOW_START = "2019-01-01"
-INITIAL_WINDOW_END = "2019-03-01"
-INITIAL_NEXT_BATCH = "2019-04-01"
-
 
 def get_db_config():
     return {
@@ -104,6 +102,22 @@ def ensure_schema(conn):
             );
             """
         )
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS supplied_batches (
+                batch_month DATE PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                rows INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS training_runs (
+                run_id TEXT PRIMARY KEY,
+                batch_month DATE NOT NULL,
+                version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                decision JSONB NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
     conn.commit()
     logger.info("Схема витрины проверена.")
 
@@ -130,9 +144,6 @@ def load_csv():
         raise FileNotFoundError(f"Не найден файл размеченных данных: {CSV_PATH}")
     logger.info("Чтение %s", CSV_PATH)
     frame = pd.read_csv(CSV_PATH)
-    missing = [column for column in COLUMNS if column not in frame.columns]
-    if missing:
-        raise ValueError(f"В CSV нет колонок: {missing}")
     frame = frame[COLUMNS].copy()
     frame["transaction_time"] = pd.to_datetime(frame["transaction_time"])
     logger.info(
@@ -165,7 +176,6 @@ def copy_frame(conn, frame):
             """,
             buffer,
         )
-    conn.commit()
     logger.info("В витрину labeled_transactions загружено %s строк.", len(frame))
 
 
@@ -175,19 +185,27 @@ def ensure_state(conn):
         if cur.fetchone()[0]:
             logger.info("training_state уже заполнен, указатель месяца не сбрасывается.")
             return
+        cur.execute("SELECT date_trunc('month', min(transaction_time))::date FROM labeled_transactions")
+        start = cur.fetchone()[0]
+        end = start + relativedelta(months=WINDOW_MONTHS - 1)
+        cur.execute("""
+            SELECT count(DISTINCT date_trunc('month', transaction_time))
+            FROM labeled_transactions WHERE transaction_time >= %s AND transaction_time < %s
+        """, (start, end + relativedelta(months=1)))
+        if cur.fetchone()[0] != WINDOW_MONTHS:
+            raise ValueError("CSV должен содержать полное стартовое окно месяцев")
         cur.execute(
             """
             INSERT INTO training_state (id, window_start, window_end, next_batch_month)
             VALUES (1, %s, %s, %s)
             """,
-            (INITIAL_WINDOW_START, INITIAL_WINDOW_END, INITIAL_NEXT_BATCH),
+            (start, end, end + relativedelta(months=1)),
         )
-    conn.commit()
     logger.info(
         "Стартовое окно обучения: %s — %s, первый батч DAG: %s",
-        INITIAL_WINDOW_START,
-        INITIAL_WINDOW_END,
-        INITIAL_NEXT_BATCH,
+        start,
+        end,
+        end + relativedelta(months=1),
     )
 
 
@@ -225,7 +243,7 @@ def materialize_window(conn):
         conn,
         params=(window_start, end_exclusive.to_pydatetime()),
     )
-    frame.to_parquet(CURRENT_DATASET, index=False)
+    write_parquet(frame, CURRENT_DATASET)
     os.chmod(CURRENT_DATASET, 0o666)
     logger.info(
         "Исходный датасет обучения: %s строк, %s — %s, файл %s",
@@ -246,6 +264,7 @@ def main():
             logger.info("Витрина labeled_transactions уже заполнена, повторная загрузка пропущена.")
         ensure_time_index(conn)
         ensure_state(conn)
+        conn.commit()
         materialize_window(conn)
     finally:
         conn.close()

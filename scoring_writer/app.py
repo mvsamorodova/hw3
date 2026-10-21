@@ -35,6 +35,7 @@ def create_table(conn):
         cur.execute("""
             ALTER TABLE scores ADD COLUMN IF NOT EXISTS model_version TEXT;
         """)
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS scores_transaction_id_idx ON scores (transaction_id)")
         conn.commit()
         logger.info("Таблица 'scores' проверена или создана.")
 
@@ -43,7 +44,8 @@ def insert_score(conn, data):
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO scores (transaction_id, score, fraud_flag, model_version)
-            VALUES (%s, %s, %s, %s);
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (transaction_id) DO NOTHING;
         """, (
             data["transaction_id"],
             data["score"],
@@ -61,6 +63,7 @@ def run_consumer():
         'bootstrap.servers': kafka_bootstrap_servers,
         'group.id': 'scoring-writer',
         'auto.offset.reset': 'earliest',
+        'enable.auto.commit': False,
     }
 
     logger.info(f"Подключение к Kafka: {kafka_bootstrap_servers}, топик: {scoring_topic}")
@@ -97,11 +100,14 @@ def run_consumer():
                         logger.info(f"Записано в БД: {data['transaction_id']}")
                 else:
                     logger.error(f"Ожидался список, получен: {type(data_list)}")
+                consumer.commit(message=msg, asynchronous=False)
 
             except json.JSONDecodeError as je:
                 logger.exception(f"Ошибка декодирования JSON: {je}")
             except Exception as e:
+                conn.rollback()
                 logger.exception(f"Ошибка обработки сообщения: {e}")
+                raise
 
     except KeyboardInterrupt:
         logger.info("Потребитель остановлен пользователем.")

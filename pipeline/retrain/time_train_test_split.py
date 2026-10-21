@@ -1,52 +1,26 @@
-"""Временной train/test split трёхмесячного окна."""
-
-import logging
+from pathlib import Path
 
 import pandas as pd
 
-from pipeline.settings import SPLITS_DIR
-
-logger = logging.getLogger(__name__)
+from pipeline.artifacts import write_parquet
+from pipeline.dq.check_dataset import require_quality
 
 
 def time_train_test_split(window_info: dict) -> dict:
-    """Делит окно по времени: два более ранних месяца в train, свежий месяц в test.
-
-    Читает parquet окна из window_info, сортирует по transaction_time и
-    сохраняет сырые части в splits/train_raw.parquet и splits/test_raw.parquet.
-    Колонка времени остаётся, потому что препроцессинг сам строит календарные признаки.
-    Возвращает пути к частям, месяц батча и подписи месяцев train и test.
-    """
-    SPLITS_DIR.mkdir(parents=True, exist_ok=True)
-    frame = pd.read_parquet(window_info["dataset_path"])
-    frame["transaction_time"] = pd.to_datetime(frame["transaction_time"])
-    frame = frame.sort_values("transaction_time")
-    periods = frame["transaction_time"].dt.to_period("M")
-    latest = periods.max()
-    train = frame.loc[periods < latest]
-    test = frame.loc[periods == latest]
-    if train.empty or test.empty:
-        raise RuntimeError(
-            f"Не удалось разрезать окно по времени: train={len(train)}, test={len(test)}"
-        )
-
-    train_path = SPLITS_DIR / "train_raw.parquet"
-    test_path = SPLITS_DIR / "test_raw.parquet"
-    train.to_parquet(train_path, index=False)
-    test.to_parquet(test_path, index=False)
-    train_months = sorted(periods.loc[periods < latest].unique().astype(str))
-    logger.info(
-        "Train месяцы %s (%s строк), test %s (%s строк).",
-        train_months,
-        len(train),
-        latest,
-        len(test),
-    )
+    """Читает pending, пишет train/test по времени; повтор заменяет те же файлы."""
+    frame = pd.read_parquet(window_info["dataset_path"]).sort_values("transaction_time")
+    require_quality(frame)
+    periods = pd.to_datetime(frame["transaction_time"]).dt.to_period("M")
+    month = pd.Period(window_info["batch_month"], freq="M")
+    if periods.max() != month:
+        raise ValueError("Последний месяц окна не совпадает с месяцем запуска")
+    train, test = frame.loc[periods < month], frame.loc[periods == month]
+    directory = Path(window_info["dataset_path"]).parent
+    train_path, test_path = directory / "train_raw.parquet", directory / "test_raw.parquet"
+    write_parquet(train, train_path)
+    write_parquet(test, test_path)
     return {
-        "train_raw_path": str(train_path),
-        "test_raw_path": str(test_path),
-        "dataset_path": window_info["dataset_path"],
-        "batch_month": window_info["batch_month"],
-        "train_months": ",".join(train_months),
-        "test_month": str(latest),
+        **window_info, "train_raw_path": str(train_path), "test_raw_path": str(test_path),
+        "train_months": sorted(periods.loc[periods < month].astype(str).unique().tolist()),
+        "test_month": str(month),
     }

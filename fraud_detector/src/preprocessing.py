@@ -9,11 +9,9 @@ logger = logging.getLogger(__name__)
 def load_train_data():
     logger.info('Loading training data...')
 
-    # Import Train dataset
     train = pd.read_csv('./train_data/train.csv')
     logger.info('Raw train data imported. Shape: %s', train.shape)
 
-    # Add some features
     train = add_features(train)
     logger.info('Train data processed. Shape: %s', train.shape)
 
@@ -32,6 +30,10 @@ def haversine(lat1, lon1, lat2, lon2):
 
 def add_features(df):
     df_ = df.copy()
+    for column in ["amount", "lat", "lon", "merchant_lat", "merchant_lon", "population_city", "post_code"]:
+        df_[column] = pd.to_numeric(df_[column], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0)
+    for column in ["merch", "cat_id", "gender", "one_city", "us_state", "jobs"]:
+        df_[column] = df_[column].fillna("unknown").astype(str)
     df_['haversine'] = haversine(df_['lat'], df_['lon'],
                                  df_['merchant_lat'], df_['merchant_lon'])
     df_["transaction_time"] = pd.to_datetime(df_["transaction_time"])
@@ -41,14 +43,17 @@ def add_features(df):
     df_["hour"] = df_["transaction_time"].dt.hour
     df_["minute"] = df_["transaction_time"].dt.minute
     df_["weekend"] = (df_["transaction_time"].dt.dayofweek > 4).astype(int)
-    return df_.drop(columns=["transaction_time", "name_1", "name_2", "street"])
+    df_["amount_log"] = np.log1p(df_["amount"].clip(lower=0))
+    df_["hour_sin"] = np.sin(2 * np.pi * df_["hour"] / 24)
+    df_["hour_cos"] = np.cos(2 * np.pi * df_["hour"] / 24)
+    df_["is_night"] = (df_["hour"] < 6).astype(int)
+    df_["amount_per_capita"] = df_["amount"] / df_["population_city"].clip(lower=1)
+    return df_.drop(columns=["transaction_time", "name_1", "name_2", "street", "transaction_id"], errors="ignore")
 
 
-# Main preprocessing function
 def run_preproc(input_df):
-    # Add features
+    """Строит одинаковые признаки для обучения и скоринга без fit на test."""
     output_df = add_features(input_df)
     logger.info('Added new features. Output shape: %s', output_df.shape)
 
-    # Return resulting dataset
     return output_df

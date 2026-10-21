@@ -34,6 +34,7 @@ class ProcessingService:
             'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
             'group.id': 'ml-scorer',
             'auto.offset.reset': 'earliest',
+            'enable.auto.commit': False,
         }
         self.producer_config = {
             'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
@@ -79,7 +80,9 @@ class ProcessingService:
                 logger.error(f"Kafka error: {msg.error()}")
                 continue
             
-            self.process_message(msg)
+            if not self.process_message(msg):
+                raise RuntimeError("Не удалось обработать транзакцию")
+            self.consumer.commit(message=msg, asynchronous=False)
 
 
 if __name__ == "__main__":
